@@ -4,8 +4,8 @@
 #include <linux/llist.h>
 #include <ktypes.h>
 
-#define PATH_MAX 256
-#define MAX_PATHS 10
+#define PATH_MAX 2048
+#define MAX_PATHS 1024
 #define LOOKUP_FOLLOW 0x0001
 #define HASH_LEN_DECLARE u32 hash; u32 len
 

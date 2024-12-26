@@ -1,315 +1,476 @@
 #include <compiler.h>
 #include <kpmodule.h>
 #include <linux/printk.h>
-#include <linux/uaccess.h>
-#include <syscall.h>
 #include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/string.h>
-#include <linux/kern_levels.h>
-#include <kpmalloc.h>
-#include <asm/current.h>
 #include "file.h"
-#include "data_parse.h"
+#include <syscall.h>
+
+
 
 KPM_NAME("File_Guard");
-KPM_VERSION("1.0.0");
-KPM_AUTHOR("yuuki");
+KPM_VERSION("1.21.51");
+KPM_AUTHOR("yuuki & shapaozidex");
 KPM_DESCRIPTION("Prevent your phone from being maliciously formatted");
-
-typedef struct file *(*do_filp_open_func_t)(int dfd, struct filename *pathname, const struct open_flags *op);
-static do_filp_open_func_t original_do_filp_open = NULL;
-static do_filp_open_func_t backup_do_filp_open = NULL;
-static struct file *replace_do_filp_open(int dfd, struct filename *pathname, const struct open_flags *op);
 
 static hook_err_t hook_err = HOOK_NOT_HOOK;
 
-static int (*do_unlinkat)(int dfd, struct filename *name);
+static struct file *(*do_filp_open)(int dfd, struct filename *pathname, const struct open_flags *op);
+static int (*do_unlinkat)(void *mnt_userns, struct inode *dir, struct dentry *dentry, bool force);
 static int (*do_rmdir)(int dfd, struct filename *name);
-static int (*vfs_rename)(struct renamedata *rd);
+static int (*do_renameat2)(int olddfd, struct filename *oldname,int newdfd, struct filename *newname,unsigned int flags);
 
-int (*kern_path)(const char *name, unsigned int flags, struct path *path) = NULL;
 char *(*dentry_path_raw)(const struct dentry *dentry, char *buf, int buflen) = NULL;
-char *(*d_path)(const struct path *path, char *buf, int buflen) = NULL;
-void (*path_put)(const struct path *path) = NULL;
-void (*fput)(struct file *file) = NULL;
 
-void *(*kf_vmalloc)(unsigned long size) = NULL;
-void (*kf_vfree)(const void *addr) = NULL;
 
 static char protected_directories[MAX_PATHS][PATH_MAX];
 static int path_count = 0;
+// 不要问为什么定义了这么多日志级别，但却只用INFO，问就是都删了，不删看着麻烦
+// 定义日志级别
+typedef enum
+{
+    LOG_LEVEL_ALL,
+    LOG_LEVEL_DEVELOPER,
+    LOG_LEVEL_DEBUG,
+    LOG_LEVEL_INFO,
+    LOG_LEVEL_NO
+} log_level_t;
 
-static bool check_path(struct filename *name){
-    struct path path;
-    char buf[PATH_MAX];
-    int error;
+// 当前日志级别
+static log_level_t current_log_level = LOG_LEVEL_INFO;
 
-    memset(buf, 0, PATH_MAX);
+// 日志输出宏
+#define LOG(level, fmt, ...)                                \
+    do                                                      \
+    {                                                       \
+        if (current_log_level <= level)                     \
+        {                                                   \
+            if (level == LOG_LEVEL_ALL)                     \
+            {                                               \
+                pr_info("[ALL] " fmt, ##__VA_ARGS__);       \
+            }                                               \
+            else if (level == LOG_LEVEL_DEVELOPER)          \
+            {                                               \
+                pr_info("[DEVELOPER] " fmt, ##__VA_ARGS__); \
+            }                                               \
+            else if (level == LOG_LEVEL_DEBUG)              \
+            {                                               \
+                pr_info("[DEBUG] " fmt, ##__VA_ARGS__);     \
+            }                                               \
+            else if (level == LOG_LEVEL_INFO)               \
+            {                                               \
+                pr_info("[INFO] " fmt, ##__VA_ARGS__);      \
+            }                                               \
+        }                                                   \
+    } while (0)
 
-    error = kern_path(name->name, LOOKUP_FOLLOW, &path);
-    if (error) {
-        //pr_err("[yuuki] kern_path failed: %d\n", error);
-        return false;
-    }
 
-    char* res = d_path(&path, buf, PATH_MAX);
-    if (IS_ERR(res)) {
-        pr_err("[yuuki] d_path failed: %ld\n", PTR_ERR(res));
-        path_put(&path);
-        return false;
-    }
 
-    path_put(&path);
 
-    // user_path
-    for (int i = 0; i < path_count; i++) {
-        if (strncmp(res, protected_directories[i], getFolderLength(protected_directories[i])) == 0) {
-            return true;
-        }
-    }
 
-    return false;
-}
 
-static void do_unlinkat_before(hook_fargs2_t* args, void* udata) {
+
+
+static void do_unlinkat_before(hook_fargs4_t* args, void* udata) {
     struct filename* pathname = (struct filename*)args->arg1;
-    if(check_path(pathname)){
-        pr_info("[yuuki] Interception successful  --- rm file\n");
-        args->skip_origin = true;
-    }
-}
+    char path_buf[PATH_MAX];
 
-static void do_rmdir_before(hook_fargs2_t* args, void* udata) {
-    struct filename* pathname = (struct filename*)args->arg1;
-    if(check_path(pathname)){
-        pr_info("[yuuki] Interception successful  --- rm dir\n");
-        args->skip_origin = true;
-    }
-}
+    // 默认放行
+    args->skip_origin = false;
+    args->ret = 0;
 
-static void vfs_rename_before(hook_fargs1_t* args, void* udata) {
-    struct renamedata *rd = (struct renamedata*)args->arg0;
-    struct path path;
-    char buf[PATH_MAX];
-    memset(buf, 0, PATH_MAX);
-
-    //由于dentry_path_raw获取的路径不一定是绝对路径，所以需要反向遍历字符串比较
-    //这里有点不严谨了，因为实在不知道怎么获取绝对路径了
-    char* old_path = dentry_path_raw(rd->old_dentry, buf, PATH_MAX);
-
-    if (IS_ERR(old_path)) {
-        pr_err("[yuuki] old_path parse failed\n");
+    // 更严格的路径检查
+    if (!pathname || IS_ERR(pathname) || !pathname->name) {
         return;
     }
 
-    // user_path
+    // 初始化缓冲区
+    memset(path_buf, 0, PATH_MAX);
+    strncpy(path_buf, pathname->name, PATH_MAX - 1);
+
+    // 检查是否在受保护目录列表中
     for (int i = 0; i < path_count; i++) {
-        if (isSubstringAtEnd(old_path, protected_directories[i])) {
-            pr_info("[yuuki] Interception successful  --- rename file\n");
+        if (strstr(path_buf, protected_directories[i]) != NULL) {
+            LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] do_unlinkat_before: 拦截删除文件操作: %s\n", path_buf);
             args->skip_origin = true;
+            args->ret = -EACCES;
+            return;
         }
     }
 
+    // 如果没有匹配任何规则，保持默认的跳过行为
+    return;
 }
 
-static struct file *replace_do_filp_open(int dfd, struct filename *pathname, const struct open_flags *op) {
-    struct file *filp = backup_do_filp_open(dfd, pathname, op);
-    if (likely(!IS_ERR(filp))) {
-        char buf[PATH_MAX];
-        memset(&buf, 0, PATH_MAX);
-        char *currPath = d_path(&filp->f_path, buf, PATH_MAX);
 
-        if ((op->open_flag & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_PATH | O_NOFOLLOW)) != 0 && strlen(currPath) > 13) { //我也不知道最后两个标志位是干嘛的，但是mt用了这两个，我也没有找到通过这俩实现文件读写的例子
-            // user_path
-            for (int i = 0; i < path_count; i++) {
-                if (strncmp(currPath, protected_directories[i], strlen(protected_directories[i])) == 0) {
-                    pr_info("[yuuki] Interception successful --- open file\n");
-                    fput(filp);
-                    return ERR_PTR(-EACCES);
-                }
-            }
-        }
-    }
-    return filp;
-}
 
-static inline bool hook_do_unlinkat() {
-    if(do_unlinkat){
-        hook_err = hook_wrap(do_unlinkat, 2, do_unlinkat_before, NULL, NULL);
-        if (hook_err != HOOK_NO_ERR) {
-            pr_info("[yuuki] hook do_unlinkat, %llx, error: %d\n", do_unlinkat, hook_err);
-        } else {
-            return true;
-        }
-    } else {
-        hook_err = HOOK_BAD_ADDRESS;
-        pr_err("[yuuki] no symbol: do_unlinkat\n");
+
+
+static void do_rmdir_before(hook_fargs2_t *args, void *udata)
+{
+    struct filename* pathname = (struct filename*)args->arg1;
+    char path_buf[PATH_MAX];
+
+    // 默认放行
+    args->skip_origin = false;
+    args->ret = 0;
+
+    // 更严格的路径检查
+    if (!pathname || IS_ERR(pathname) || !pathname->name) {
+        return;
     }
 
-    return false;
-}
+    // 初始化缓冲区
+    memset(path_buf, 0, PATH_MAX);
+    strncpy(path_buf, pathname->name, PATH_MAX - 1);
 
-static inline bool hook_do_rmdir() {
-    if(do_rmdir){
-        hook_err = hook_wrap(do_rmdir, 2, do_rmdir_before, NULL, NULL);
-        if (hook_err != HOOK_NO_ERR) {
-            pr_info("[yuuki] hook do_rmdir, %llx, error: %d\n", do_rmdir, hook_err);
-        } else {
-            return true;
+    // 检查是否在受保护目录列表中
+    for (int i = 0; i < path_count; i++) {
+        if (strstr(path_buf, protected_directories[i]) != NULL) {
+            LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] do_rmdir_before: 拦截删除目录操作: %s\n", path_buf);
+            args->skip_origin = true;
+            args->ret = -EACCES;
+            return;
         }
-    } else {
-        hook_err = HOOK_BAD_ADDRESS;
-        pr_err("[yuuki] no symbol: do_rmdir\n");
     }
 
-    return false;
+    // 如果没有匹配任何规则，保持默认的跳过行为
+    return;
 }
 
-static inline bool hook_vfs_rename() {
-    if(vfs_rename){
-        hook_err = hook_wrap(vfs_rename, 1, vfs_rename_before, NULL, NULL);
-        if (hook_err != HOOK_NO_ERR) {
-            pr_info("[yuuki] hook vfs_rename, %llx, error: %d\n", vfs_rename, hook_err);
-        } else {
-            return true;
-        }
-    } else {
-        hook_err = HOOK_BAD_ADDRESS;
-        pr_err("[yuuki] no symbol: vfs_rename\n");
+static void do_renameat2_before(hook_fargs5_t* args, void* udata) {
+    struct filename* oldname = (struct filename*)args->arg1;
+    struct filename* newname = (struct filename*)args->arg3;
+    char old_path[PATH_MAX];
+    char new_path[PATH_MAX];
+
+    // 默认放行
+    args->skip_origin = false;
+    args->ret = 0;
+
+    // 检查路径有效性
+    if (!oldname || IS_ERR(oldname) || !oldname->name ||
+        !newname || IS_ERR(newname) || !newname->name) {
+        return;
     }
 
-    return false;
-}
+    // 获取源路径和目标路径
+    memset(old_path, 0, PATH_MAX);
+    memset(new_path, 0, PATH_MAX);
+    strncpy(old_path, oldname->name, PATH_MAX - 1);
+    strncpy(new_path, newname->name, PATH_MAX - 1);
 
-static inline bool hook_do_filp_open() {
-    if (original_do_filp_open) {
-        hook_err = hook((void *)original_do_filp_open, (void *)replace_do_filp_open, (void **)&backup_do_filp_open);
-        if (hook_err != HOOK_NO_ERR) {
-            pr_info("[yuuki] hook do_filp_open, %llx, error: %d\n", original_do_filp_open, hook_err);
-        } else {
-            return true;
+    // 检查是否在受保护目录列表中
+    for (int i = 0; i < path_count; i++) {
+        if (strstr(old_path, protected_directories[i]) != NULL || 
+            strstr(new_path, protected_directories[i]) != NULL) {
+            LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] do_renameat2_before: 拦截重命名操作: %s -> %s\n", old_path, new_path);
+            args->skip_origin = true;
+            args->ret = -EACCES;
+            return;
         }
-    } else {
-        hook_err = HOOK_BAD_ADDRESS;
-        pr_err("[yuuki] no symbol: do_filp_open\n");
-    }
-    return false;
-}
-
-static inline bool installHook() {
-    bool ret = false;
-
-    if (hook_err != HOOK_NO_ERR) {
-        if (hook_do_filp_open() && hook_do_unlinkat() && hook_do_rmdir() && hook_vfs_rename()) {
-            pr_info("[yuuki] hook installed...\n");
-            ret = true;
-        } else {
-            pr_err("[yuuki] hook installation failed...\n");
-        }
-    } else {
-        pr_info("[yuuki] hook already installed, skipping...\n");
-        ret = true;
     }
 
-    return ret;
+    // 如果没有匹配任何规则，保持默认的跳过行为
+    return;
 }
 
-static inline bool uninstallHook() {
+
+
+static void do_filp_open_before(hook_fargs3_t* args, void* udata) {
+    struct filename* pathname = (struct filename*)args->arg1;
+    const struct open_flags *op = (const struct open_flags *)args->arg2;
+    char path_buf[PATH_MAX];
+    
+    // 默认放行
+    args->skip_origin = false;
+    args->ret = 0;
+    
+    
+    // 只在写入和创建时进行保护
+    if (!(op->open_flag & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC ))) {
+        args->skip_origin = false;
+        args->ret = 0;
+        return;
+    }
+
+    // 更严格的路径检查
+    if (!pathname || IS_ERR(pathname) || !pathname->name) {
+        return;
+    }
+
+    // 初始化缓冲区
+    memset(path_buf, 0, PATH_MAX);
+    strncpy(path_buf, pathname->name, PATH_MAX - 1);
+
+    // 检查是否在受保护目录列表中
+    for (int i = 0; i < path_count; i++) {
+        if (strstr(path_buf, protected_directories[i]) != NULL) {
+            LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] do_filp_open_before: 拦截文件操作: %s\n", path_buf);
+            args->skip_origin = true;
+            args->ret = -EACCES;
+            return;
+        }
+    }
+
+    // 如果没有匹配任何规则，保持默认的跳过行为
+    return;
+}
+
+static inline bool installHook()
+{
+    // 如果已经安装了hook，直接返回true
     if (hook_err == HOOK_NO_ERR) {
-        unhook((void*)do_unlinkat);
-        unhook((void*)do_rmdir);
-        unhook((void*)vfs_rename);
-        unhook((void *)original_do_filp_open);
-        hook_err = HOOK_NOT_HOOK;
-        pr_info("[yuuki] hook uninstalled...\n");
+        return true;
+    }
+
+    // 定义需要安装的hook结构
+    struct hook_info {
+        const char *name;           // hook名称
+        void *func;                 // 被hook的函数
+        int args_num;              // 参数数量
+        void *before_func;         // hook前的处理函数
+        hook_err_t *err;           // 错误状态
+    } hooks[] = {
+        {"do_unlinkat", do_unlinkat, 4, do_unlinkat_before, &hook_err},
+        {"do_rmdir", do_rmdir, 2, do_rmdir_before, &hook_err},
+        {"do_renameat2", do_renameat2, 5, do_renameat2_before, &hook_err},
+        {"do_filp_open", do_filp_open, 3, do_filp_open_before, &hook_err}
+    };
+
+    // 安装所有hook
+    bool success = true;
+    for (int i = 0; i < sizeof(hooks) / sizeof(hooks[0]); i++) {
+        if (!hooks[i].func) {
+            *hooks[i].err = HOOK_BAD_ADDRESS;
+            LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] %s: hook失败 - 地址无效: 0x%llx\n", 
+                hooks[i].name, (unsigned long long)hooks[i].func);
+            success = false;
+            continue;
+        }
+
+        *hooks[i].err = hook_wrap(hooks[i].func, hooks[i].args_num, hooks[i].before_func, NULL, NULL);
+        if (*hooks[i].err != HOOK_NO_ERR) {
+            LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] %s: hook失败 - 地址: 0x%llx, 错误: %d\n", 
+                hooks[i].name, (unsigned long long)hooks[i].func, *hooks[i].err);
+            success = false;
+            continue;
+        }
+
+        LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] %s: hook成功 - 地址: 0x%llx\n", 
+            hooks[i].name, (unsigned long long)hooks[i].func);
+    }
+
+    if (success) {
+        LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] Hook 安装成功\n");
     } else {
-        pr_info("[yuuki] Maybe it's not hooked, skipping...\n");
+        LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] Hook 安装失败\n");
+    }
+
+    return success;
+}
+
+
+
+
+
+
+
+
+static inline bool uninstallHook()
+{
+    if (hook_err == HOOK_NO_ERR)
+    {
+        unhook((void *)do_rmdir);
+        unhook((void *)do_renameat2);
+        unhook((void *)do_unlinkat);
+        unhook((void *)do_filp_open);
+        hook_err = HOOK_NOT_HOOK;
+        LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] hook 卸载成功...\n");
+    }
+    else
+    {
+        LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] Maybe it's not hooked, skipping...\n");
     }
     return true;
 }
 
-static inline bool control_internal(bool enable) {
+
+
+
+
+
+
+
+static inline bool control_internal(bool enable)
+{
     return enable ? installHook() : uninstallHook();
 }
 
-static long mod_init(const char *args, const char *event, void *__user reserved){
-    pr_info("[yuuki] Initializing...\n");
-    pr_info("[yuuki] ARGS = %s\n", args);
 
-    original_do_filp_open = (do_filp_open_func_t)kallsyms_lookup_name("do_filp_open");
-    do_unlinkat = (typeof(do_unlinkat))kallsyms_lookup_name("do_unlinkat");
-    do_rmdir = (typeof(do_rmdir))kallsyms_lookup_name("do_rmdir");
-    vfs_rename = (typeof(vfs_rename))kallsyms_lookup_name("vfs_rename");
 
-    kf_vmalloc = (typeof(kf_vmalloc))kallsyms_lookup_name("vmalloc");
-    kf_vfree = (typeof(kf_vfree))kallsyms_lookup_name("vfree");
-    long ret = 0;
+static long mod_init(const char *args, const char *event, void *__user reserved) {
+    LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] Initializing...\n");
+    LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] ARGS = %s\n", args);
 
-    pr_info("[yuuki] Kernel Version: %x\n", kver);
-    pr_info("[yuuki] Kernel Patch Version: %x\n", kpver);
+    // 定义需要查找的内核函数结构
+    struct kernel_symbol {
+        const char *name;        // 内核函数的符号名
+        void **func_ptr;        // 用于存储函数指针的地址
+        const char *err_msg;     // 查找失败时的错误信息
+    } symbols[] = {
+        {"do_filp_open", (void **)&do_filp_open, "do_filp_open"},
+        {"do_unlinkat", (void **)&do_unlinkat, "do_unlinkat"},
+        {"do_rmdir", (void **)&do_rmdir, "do_rmdir"},
+        {"do_renameat2", (void **)&do_renameat2, "do_renameat2"},
+        {"dentry_path_raw", (void **)&dentry_path_raw, "dentry_path_raw"}
+    };
 
-    kern_path = (int (*)(const char *, unsigned int , struct path *))kallsyms_lookup_name("kern_path");
-    if (!kern_path) {
-        pr_info("[yuuki] kernel func: 'kern_path' does not exist!\n");
-        goto exit;
+    // 查找所有需要的内核函数
+    for (int i = 0; i < sizeof(symbols) / sizeof(symbols[0]); i++) {
+        *symbols[i].func_ptr = (void *)kallsyms_lookup_name(symbols[i].name);
+        if (!*symbols[i].func_ptr) {
+            LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] kernel func: '%s' does not exist!\n", 
+                symbols[i].err_msg);
+            return -1;
+        }
     }
 
-    dentry_path_raw = (typeof(dentry_path_raw))kallsyms_lookup_name("dentry_path_raw");
-    if (!dentry_path_raw) {
-        pr_info("[yuuki] kernel func: 'dentry_path_raw' does not exist!\n");
-        goto exit;
-    }
-
-    d_path = (char *(*)(const struct path *, char *, int))kallsyms_lookup_name("d_path");
-    if (!d_path) {
-        pr_info("[yuuki] kernel func: 'd_path' does not exist!\n");
-        goto exit;
-    }
-
-    path_put = (void (*)(const struct path *))kallsyms_lookup_name("path_put");
-    if (!path_put) {
-        pr_info("[yuuki] kernel func: 'path_put' does not exist!\n");
-        goto exit;
-    }
-
-    fput = (void (*)(struct file *))kallsyms_lookup_name("fput");
-    if (!fput) {
-        pr_info("[yuuki] kernel func: 'fput' does not exist!\n");
-        goto exit;
-    }
-
-    exit:
-    return ret;
+    LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] Kernel Version: %x\n", kver);
+    LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] Kernel Patch Version: %x\n", kpver);
+    
+    return 0;
 }
 
-static long mod_control0(const char *args, char *__user out_msg, int outlen) {
-    pr_info("[yuuki] kpm hello control0, args: %s\n", args);
+// 添加目录到保护列表
+static bool add_protected_directory(const char *path) {
+    if (!path || !*path) {
+        LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] mod_control0 add: 未提供路径\n");
+        return false;
+    }
 
-    if(strncmp(args, "unhook", 6) == 0){
-        path_count = 0;
-        control_internal(false);
-        pr_info("[yuuki] uninstalled hook.\n");
+    if (path_count >= MAX_PATHS) {
+        LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] mod_control0 add: 达到上限 %d\n", path_count);
+        return false;
+    }
 
-    } else {
-        parse_paths(args, protected_directories, &path_count);
-
-        for (int i = 0; i < path_count; i++) {
-            pr_info("[yuuki] path %d: %s\n", i + 1, protected_directories[i]);
+    // 检查重复
+    for (int i = 0; i < path_count; i++) {
+        if (strncmp(protected_directories[i], path, PATH_MAX) == 0) {
+            LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] mod_control0 add: %s 已存在\n", path);
+            return false;
         }
+    }
 
+    // 添加目录
+    if (path[0] != '/') {
+        protected_directories[path_count][0] = '/';
+        strncpy(protected_directories[path_count] + 1, path, PATH_MAX - 2);
+    } else {
+        strncpy(protected_directories[path_count], path, PATH_MAX - 1);
+    }
+    protected_directories[path_count][PATH_MAX - 1] = '\0';
+    
+    LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] mod_control0 add: 添加成功 %s\n", 
+        protected_directories[path_count]);
+    path_count++;
+    return true;
+}
+
+// 从保护列表中移除目录
+static bool remove_protected_directory(const char *path) {
+    if (!path || !*path || path_count <= 0) {
+        LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] mod_control0 remove: 无效参数\n");
+        return false;
+    }
+
+    for (int i = 0; i < path_count; i++) {
+        if (strncmp(protected_directories[i], path, PATH_MAX) == 0) {
+            memmove(protected_directories[i], protected_directories[i + 1], 
+                   (path_count - i - 1) * PATH_MAX);
+            path_count--;
+            LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] mod_control0 remove: 删除成功 %s\n", path);
+            return true;
+        }
+    }
+
+    LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] mod_control0 remove: %s 不存在\n", path);
+    return false;
+}
+
+// 出所有受保护的目录
+static void list_protected_directories(void) {
+    if (path_count == 0) {
+        LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] mod_control0 ls: 无保护目录\n");
+        return;
+    }
+
+    LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] mod_control0 ls:\n");
+    for (int i = 0; i < path_count; i++) {
+        LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] %d: %s 地址: 0x%llx\n", i + 1, protected_directories[i]);
+    }
+}
+
+// 添加预设保护路径函数
+static void add_default_protected_paths(void) {
+    const char *default_paths[] = {
+        "/storage/spzcc",
+        // "/data",
+        // "/system",s
+        // "/vendor",
+        // "/product"
+    };
+    
+    for (int i = 0; i < sizeof(default_paths) / sizeof(default_paths[0]); i++) {
+        if (add_protected_directory(default_paths[i])) {
+            // LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] mod_control0 add: %s - 0x%llx\n", default_paths[i], (unsigned long long)default_paths[i]);
+        }
+    }
+}
+
+// 主控制函数
+static long mod_control0(const char *args, char *__user out_msg, int outlen) {
+    LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] mod_control0: 收到命令: %s\n", args);
+
+    if (strncmp(args, "rm -rf", 6) == 0) {
+        add_default_protected_paths();
         control_internal(true);
     }
+    else if (strncmp(args, "add", 3) == 0) {
+        // 不管 add_protected_directory 返回什么结果，都认为是有效命令
+        if (add_protected_directory(args + 4)) {
+            control_internal(true);
+        }
+    }
+    else if (strncmp(args, "remove", 6) == 0) {
+        remove_protected_directory(args + 7);
+    }
+    else if (strncmp(args, "unhook", 6) == 0) {
+        path_count = 0;
+        control_internal(false);
+        LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] mod_control0: 卸载保护\n");
+    }
+    else if (strncmp(args, "ls", 2) == 0) {
+        list_protected_directories();
+    }
+    else {
+        LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] mod_control0: 未知命令 %s\n", args);
+    }
 
     return 0;
 }
 
-static long mod_exit(void *__user reserved) {
+
+static long mod_exit(void *__user reserved)
+{
     path_count = 0;
     control_internal(false);
-    pr_info("[yuuki] mod_exit, uninstalled hook.\n");
+    LOG(LOG_LEVEL_INFO, "[yuuki&shapaozidex] mod_exit, uninstalled hook.\n");
     return 0;
 }
+
+
 
 KPM_INIT(mod_init);
 KPM_CTL0(mod_control0);
