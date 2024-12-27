@@ -190,8 +190,6 @@ static void do_filp_open_before(hook_fargs3_t* args, void* udata) {
     
     // 只在写入和创建时进行保护
     if (!(op->open_flag & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC ))) {
-        args->skip_origin = false;
-        args->ret = 0;
         return;
     }
 
